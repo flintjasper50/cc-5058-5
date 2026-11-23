@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>维修角色目标规划器</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header>
+  <h1>维修角色目标规划器</h1>
+  <div class="sub">信念空间规划 · 真实执行反馈 · 预期/确认效果分离 · 资源守恒审计</div>
+</header>
+
+<main>
+  <section class="panel controls">
+    <h2>1. 场景与目标设置</h2>
+    <label>预置场景
+      <select id="scenarioSelect"></select>
+    </label>
+    <div class="custom">
+      <label>故障类型
+        <select id="faultSelect"></select>
+      </label>
+      <label class="chk"><input type="checkbox" id="boxTaken" checked /> 备件箱被同伴取走</label>
+      <label class="chk"><input type="checkbox" id="donorValve" /> 捐赠设备有可用阀门</label>
+      <label class="chk"><input type="checkbox" id="gasket" checked /> 工作台有密封垫</label>
+      <label class="chk"><input type="checkbox" id="sealIntact" checked /> 泵封条完好</label>
+      <fieldset>
+        <legend>工具位置 / 移除工具</legend>
+        <div id="toolRows"></div>
+      </fieldset>
+    </div>
+    <div class="btns">
+      <button id="createBtn" class="primary">设置目标并创建会话</button>
+      <button id="stepBtn">执行下一步（真实运算）</button>
+      <button id="runBtn">连续执行</button>
+      <button id="resetBtn">重置</button>
+    </div>
+    <div id="errorBox" class="error hidden"></div>
+  </section>
+
+  <section class="panel">
+    <h2>2. 当前规划（含每步成立依据与搜索成本）</h2>
+    <div id="planMeta" class="meta"></div>
+    <ol id="planList" class="plan"></ol>
+  </section>
+
+  <section class="panel">
+    <h2>3. 执行轨迹（预期效果 vs 已确认效果）</h2>
+    <div id="runState" class="meta"></div>
+    <div id="history" class="history"></div>
+  </section>
+
+  <section class="panel">
+    <h2>4. 世界状态核对（点设备/物品栏，查幽灵零件）</h2>
+    <div class="world-grid">
+      <div>
+        <h3>真世界（对角色隐藏，仅审计可见）</h3>
+        <table id="worldTable"></table>
+      </div>
+      <div>
+        <h3>角色信念（规划器唯一输入）</h3>
+        <table id="beliefTable"></table>
+      </div>
+    </div>
+    <h3>物品栏 / 设备状态点击核对</h3>
+    <div id="inventory" class="inventory"></div>
+    <div id="auditBox" class="audit"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
