@@ -105,16 +105,33 @@ function renderPlan(snap) {
     `<li class="${st.sense ? "sense" : ""}">
        ${st.action} <span class="cost">代价 ${st.cost}${st.sense ? " · 感知动作" : ""}</span>
        <span class="why">成立依据：${st.rationale}</span>
+       ${st.pre && st.pre.length
+         ? `<span class="why">前提读集（提交前在真世界复核）：${st.pre.join("、")}</span>`
+         : ""}
      </li>`).join("") || "<li>（无动作）</li>";
 }
 
-function renderHistory(snap) {
+function renderRunStatus(snap) {
+  const state = snap.failed ? "失败/不可行" : (snap.finished ? "已完成" : "执行中");
+  const cls = snap.failed ? "no" : (snap.finished ? "ok" : "");
   $("runState").innerHTML =
-    `目标 <b>${snap.goal}</b> &nbsp; 已结束 <b>${snap.finished}</b> &nbsp; ` +
-    `失败/不可行 <b>${snap.failed}</b> &nbsp; 累计真实代价 <b>${snap.total_cost}</b>`;
+    `目标 <b>${snap.goal}</b> &nbsp; 运行状态 <span class="tag ${cls}">${state}</span> &nbsp; ` +
+    `已结束 <b>${snap.finished}</b> &nbsp; 失败/不可行 <b>${snap.failed}</b> &nbsp; ` +
+    `真世界版本 <b>${snap.world_version || 0}</b> &nbsp; 累计真实代价 <b>${snap.total_cost}</b>`;
+  const anomalies = snap.anomalies || [];
+  $("anomalyBox").className = "audit " +
+    (anomalies.some((a) => a.includes("受阻") || a.includes("失败") || a.includes("异常") || a.includes("伪报") || a.includes("不可行"))
+      ? "fail" : "pass");
+  $("anomalyBox").innerHTML = "规划步骤与维修动作异常：" +
+    anomalies.map((a) => `<div>· ${a}</div>`).join("");
+}
+
+function renderHistory(snap) {
+  renderRunStatus(snap);
   $("history").innerHTML = snap.history.map((h) => {
     const cls = h.blocked ? "blocked" : (h.sense ? "sense" : "");
     const tag = h.blocked ? "受阻" : (h.sense ? "感知" : "执行");
+    const anomalies = h.anomalies || [];
     return `<div class="step ${cls}">
       <div class="head">
         <span class="tag ${h.blocked ? "blocked" : h.sense ? "sense" : "exec"}">${tag}</span>
@@ -122,13 +139,20 @@ function renderHistory(snap) {
         <span class="tag ${h.confirmed ? "ok" : "no"}">${h.confirmed ? "效果已确认" : "效果未确认"}</span>
         <span class="tag ${h.replan_status ? `status-${h.replan_status}` : ""}">${h.replan_status || "-"}</span>
         <span>累计 ${h.cumulative_cost}</span>
+        <span>真世界版本 ${h.world_version || 0}</span>
       </div>
       <div class="detail">
         ${h.blocking_reason ? `<div>受阻原因：${h.blocking_reason}</div>` : ""}
         ${h.decision ? `<div>规划决策：${h.decision}</div>` : ""}
         ${h.observation.map((o) => `<div>观察反馈：${o}</div>`).join("")}
         ${h.expected_effects.map((e) => `<div>${e}</div>`).join("")}
+        ${h.fact_added && h.fact_added.length
+          ? `<div>世界效果·新增事实：${h.fact_added.join("、")}</div>` : ""}
+        ${h.fact_removed && h.fact_removed.length
+          ? `<div>世界效果·移除事实：${h.fact_removed.join("、")}</div>` : ""}
         ${!h.audit_ok ? `<div style="color:var(--bad)">守恒异常：${h.audit_problems.join("；")}</div>` : ""}
+        ${anomalies.length
+          ? `<div class="anomaly">异常标注：${anomalies.map((a) => `· ${a}`).join(" ")}</div>` : ""}
       </div>
     </div>`;
   }).join("") || "<div class='meta'>尚未执行任何动作</div>";

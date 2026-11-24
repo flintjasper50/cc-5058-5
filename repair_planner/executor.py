@@ -1,25 +1,37 @@
-"""规划执行器：在真世界中逐步执行，结果反馈回规划状态。
+"""规划执行器：在真世界中逐步执行，结果经受控回执反馈回规划状态。
 
-核心纪律：
-1. 每个动作先在真世界校验前提（信念中的假设不构成真世界前提）。
-2. 规划产生的效果只是"预期效果"；执行成功并经观察确认后才进入信念。
-3. 失败时不提前修改设备状态（working 只由成功动作的确认观察产生）。
-4. 受阻动作先尝试复用剩余计划（逐动作验证前提），不成立才整段重算。
-5. 任何一步后做资源守恒审计，发现幽灵物品立即报错。
+规划/执行解耦边界（本模块是唯一允许变更真世界的地方）：
+1. 真世界状态只能通过受控入口 Engine.commit() 改变；commit 先在真世界复核
+   动作前提读集（信念中的假设不构成真世界前提），通过后才用与模拟器同源的
+   actions.apply 提交，并产生动作回执 Receipt。
+2. 搜索/规划过程不直接改动真实装置：分支模拟器的推演结果进不了真世界，
+   只有 commit 成功的回执才推进真世界版本号。
+3. 回执携带动作失败信息与事实前后差分（FactDelta），作为计划合法性与世界
+   效果的执行证据；confirmed 只在提交成功且守恒审计通过时为真，禁止伪报。
+4. 失败/受阻时真世界零改动（版本号不变、现场配件不被消耗）；失败观察仍经
+   受控的信念更新入口登记（如备件箱被取空的证伪）。
+5. 受阻动作先尝试复用剩余计划（逐动作验证前提），不成立才整段重算。
+6. 任何一步后做资源守恒审计，发现幽灵物品立即在回执/记录中标为异常。
+
+兼容适配：旧入口 Engine.step() 保留，内部改为调用 commit 并把回执翻译成
+历史 StepRecord，旧调用方与窗口界面的外部行为保持冻结。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any
 
 from .model import (
     State,
+    FactDelta,
+    facts_diff,
     at,
     carrying,
     installed,
     conservation_audit,
 )
-from .domain import Action, available_actions, apply, _my_place, _held
+from .actions import Action, available_actions, apply, _my_place, _held
+from .simulator import PreconditionReadSet
 from .planner import plan, PlanResult
 from .scenario import (
     Scenario,
@@ -30,6 +42,58 @@ from .scenario import (
     expected_items,
     ADJACENCY,
 )
+
+
+@dataclass
+class Receipt:
+    """动作回执：真世界一次提交的受控证据。
+
+    成功时 world_before -> world_after 经事实差分给出可核对的世界效果；
+    失败时 success=False，world_after 与 world_before 同版本、同指纹，
+    现场不发生任何变化。
+    """
+    action: str
+    kind: str
+    sense: bool
+    success: bool
+    blocked: bool
+    reason: str
+    pre: list[str]
+    read_set_verified: bool
+    missing_pre: list[str]
+    world_version_before: int
+    world_version_after: int
+    world_fingerprint_before: tuple
+    world_fingerprint_after: tuple
+    delta: FactDelta
+    audit_ok: bool
+    audit_problems: list[str]
+    observation: list[str]
+    cost_charged: int
+
+    @property
+    def confirmed(self) -> bool:
+        """效果确认 = 提交成功且守恒审计通过；无审计背书不得宣称确认。"""
+        return self.success and self.audit_ok
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action, "kind": self.kind, "sense": self.sense,
+            "success": self.success, "blocked": self.blocked,
+            "reason": self.reason, "pre": self.pre,
+            "read_set_verified": self.read_set_verified,
+            "missing_pre": self.missing_pre,
+            "world_version_before": self.world_version_before,
+            "world_version_after": self.world_version_after,
+            "world_fingerprint_changed":
+                self.world_fingerprint_before != self.world_fingerprint_after,
+            "delta": self.delta.to_dict(),
+            "audit_ok": self.audit_ok,
+            "audit_problems": self.audit_problems,
+            "observation": self.observation,
+            "cost_charged": self.cost_charged,
+            "confirmed": self.confirmed,
+        }
 
 
 @dataclass
@@ -49,6 +113,11 @@ class StepRecord:
     audit_ok: bool
     audit_problems: list[str]
     rationale: str
+    # 解耦后新增：规划步骤/维修动作相关异常与执行证据（不破坏既有字段）
+    anomalies: list[str] = field(default_factory=list)
+    world_version: int = 0
+    fact_added: list[str] = field(default_factory=list)
+    fact_removed: list[str] = field(default_factory=list)
 
 
 class Engine:
@@ -58,10 +127,13 @@ class Engine:
         self.expected = expected_items(scn)
         self.plan_queue: list[Action] = []
         self.history: list[StepRecord] = []
+        self.receipts: list[Receipt] = []
         self.total_cost = 0
         self.last_plan: PlanResult | None = None
         self.finished = False
         self.failed = False
+        # 真世界版本：仅由成功的 commit 推进；失败/取消不递增
+        self.world_version = 0
 
     # ---------- 规划 ----------
     def replan(self) -> PlanResult:
@@ -159,7 +231,7 @@ class Engine:
             return True, ""
         return False, f"未知动作 {kind}"
 
-    # ---------- 观察反馈 ----------
+    # ---------- 受控信念更新入口（回执的观察部分只能走这里） ----------
     def _observe_after(self, action: Action) -> list[str]:
         """动作成功后，按观察政策把真世界可见信息同步进信念。"""
         kind, args = action.kind, action.args
@@ -189,6 +261,25 @@ class Engine:
             before = self.belief
             self.belief = self._sync_world_visible(before)
             notes.append("操作结果已观察确认并写入信念")
+        return notes
+
+    def _register_failed_observation(self, action: Action) -> list[str]:
+        """受阻动作的观察登记：只更新信念，绝不触碰真世界。"""
+        notes: list[str] = []
+        if action.kind == "take":
+            item = action.args[0]
+            assumed = tuple(f for f in self.belief.assumptions
+                            if f[0] == "at" and f[1] == item)
+            if assumed:
+                self.belief = self.belief.with_assumptions(remove=assumed)
+                notes.append(f"抓取失败即观察：删除未证实假设 "
+                             f"{[str(a) for a in assumed]}")
+                if self.world.has(("box_taken", "spare_box")) and \
+                        not self.belief.has(("box_taken", "spare_box")):
+                    self.belief = self.belief.with_facts(
+                        add=(("box_taken", "spare_box"),
+                             ("box_checked", "spare_box")))
+                    notes.append("观察登记：备件箱已被同伴取空")
         return notes
 
     def _sync_world_visible(self, before: State) -> State:
@@ -234,6 +325,66 @@ class Engine:
                     s = s.with_facts(add=(f,))
         return s
 
+    # ---------- 受控提交入口 ----------
+    def commit(self, action: Action) -> Receipt:
+        """真世界唯一变更入口：复核前提读集 -> 提交 -> 审计 -> 观察 -> 回执。"""
+        world_before = self.world
+        fp_before = world_before.fingerprint()
+        ver_before = self.world_version
+        pre_labels = [str(p) for p in action.pre]
+
+        # 1. 提交前复核前提读集：动作生成时的每条前提在真世界必须仍是确认事实
+        read_set = PreconditionReadSet.of(world_before, action)
+        read_ok, missing = read_set.verify(world_before)
+        # 2. 领域级真世界前提（容量、导航连通性等读集之外的物理约束）
+        phys_ok, why = self._real_preconditions_hold(action)
+
+        if not (read_ok and phys_ok):
+            reason = why or f"前提读集复核失败，缺失 {[str(m) for m in missing]}"
+            # 失败观察仍经受控入口登记；真世界与版本号保持不变
+            obs = self._register_failed_observation(action)
+            audit_ok, audit_problems = self._audit()
+            receipt = Receipt(
+                action=action.label(), kind=action.kind, sense=action.sense,
+                success=False, blocked=True, reason=reason, pre=pre_labels,
+                read_set_verified=False,
+                missing_pre=[str(m) for m in missing],
+                world_version_before=ver_before, world_version_after=ver_before,
+                world_fingerprint_before=fp_before,
+                world_fingerprint_after=world_before.fingerprint(),
+                delta=facts_diff(world_before, self.world),
+                audit_ok=audit_ok, audit_problems=audit_problems,
+                observation=obs, cost_charged=0,
+            )
+            self.receipts.append(receipt)
+            return receipt
+
+        # 3. 真世界提交：与分支模拟器同源的 actions.apply；仅此处在改真世界
+        self.world = apply(world_before, action)
+        self.world_version = ver_before + 1
+        self.total_cost += action.cost
+        delta = facts_diff(world_before, self.world)
+
+        # 4. 守恒审计（无审计背书不得确认效果）
+        audit_ok, audit_problems = self._audit()
+
+        # 5. 受控观察：把真世界可见效果同步进信念
+        obs = self._observe_after(action)
+
+        receipt = Receipt(
+            action=action.label(), kind=action.kind, sense=action.sense,
+            success=True, blocked=False, reason="", pre=pre_labels,
+            read_set_verified=True, missing_pre=[],
+            world_version_before=ver_before,
+            world_version_after=self.world_version,
+            world_fingerprint_before=fp_before,
+            world_fingerprint_after=self.world.fingerprint(),
+            delta=delta, audit_ok=audit_ok, audit_problems=audit_problems,
+            observation=obs, cost_charged=action.cost,
+        )
+        self.receipts.append(receipt)
+        return receipt
+
     # ---------- 受阻后的计划决策 ----------
     def _try_reuse_suffix(self, failed: Action) -> tuple[bool, str]:
         """复用剩余计划（失败动作已出队）：从下一动作起在当前信念中重新落地。"""
@@ -277,59 +428,69 @@ class Engine:
                     f"{action.label()} 开头，状态无新观察，判定卡死", "STUCK")
         return f"复用不成立（{reuse_note}），整段重算", r.status
 
-    # ---------- 单步执行 ----------
+    # ---------- 异常标注（规划步骤/维修动作相关，界面可见） ----------
+    def _detect_anomalies(self, receipt: Receipt) -> list[str]:
+        anomalies: list[str] = []
+        if receipt.blocked:
+            anomalies.append(f"动作受阻：{receipt.reason}")
+        if not receipt.success and not receipt.blocked:
+            anomalies.append("动作失败且未产生世界效果")
+        if not receipt.audit_ok:
+            anomalies.append(f"资源守恒审计异常：{'；'.join(receipt.audit_problems)}")
+        if receipt.success and not receipt.confirmed:
+            anomalies.append("动作已提交但效果未获审计确认")
+        if receipt.success and receipt.world_version_after <= receipt.world_version_before:
+            anomalies.append("成功回执未推进真世界版本")
+        # 计划合法性/世界效果禁止伪报：信念宣称修好时真世界必须确有 working
+        if self.belief.has(("working", "pump")) and \
+                not self.world.has(("working", "pump")):
+            anomalies.append("信念伪报 working(pump)：真世界尚未修好")
+        if self.finished and not self.world.has(("working", "pump")):
+            anomalies.append("结束状态伪报：真世界不存在 working(pump)")
+        return anomalies
+
+    # ---------- 兼容适配：旧单步入口 ----------
     def step(self) -> StepRecord:
+        """旧入口：内部改为受控 commit + 重规划决策，翻译成历史 StepRecord。"""
         idx = len(self.history) + 1
         if not self.plan_queue:
             r = self.replan()
             if r.status == "INFEASIBLE":
                 self.failed = True
+                audit_ok, audit_problems = self._audit()
                 rec = StepRecord(
                     idx, "<重规划>", False, 0, [], False, True,
                     "无可用计划", ["规划器返回不可行"], "整段重算",
-                    "INFEASIBLE", self.total_cost,
-                    *self._audit(), r.reason,
+                    "INFEASIBLE", self.total_cost, audit_ok, audit_problems,
+                    r.reason,
+                    anomalies=["规划不可行：" + "；".join(r.why_infeasible) or r.reason],
+                    world_version=self.world_version,
                 )
                 self.history.append(rec)
                 return rec
-        action = self.plan_queue.pop(0)
-        ok, why = self._real_preconditions_hold(action)
-        expected = [str(p) for p in action.pre]
 
-        if not ok:
-            # 受阻：真世界不改动；但抓取假设物品失败本身是一次观察，
-            # 必须据此对账信念（证伪假设、登记备件被取走），预期效果不落实。
-            if action.kind == "take":
-                item = action.args[0]
-                assumed = tuple(f for f in self.belief.assumptions
-                                if f[0] == "at" and f[1] == item)
-                if assumed:
-                    self.belief = self.belief.with_assumptions(remove=assumed)
-                    # 若真世界显示备件箱已空，登记观察事实
-                    if self.world.has(("box_taken", "spare_box")) and \
-                            not self.belief.has(("box_taken", "spare_box")):
-                        self.belief = self.belief.with_facts(
-                            add=(("box_taken", "spare_box"),
-                                 ("box_checked", "spare_box")))
-            decision, replan_status = self._handle_blocked(action, why)
+        action = self.plan_queue.pop(0)
+        receipt = self.commit(action)
+        expected = [f"预期：{action.label()} -> 前提读集已在真世界复核"]
+
+        if not receipt.success:
+            decision, replan_status = self._handle_blocked(action, receipt.reason)
+            anomalies = self._detect_anomalies(receipt)
             rec = StepRecord(
                 idx, action.label(), action.sense, action.cost,
-                [f"预期（未落实）：{action.label()}"], False, True, why,
-                [], decision, replan_status, self.total_cost,
-                *self._audit(), action.rationale(self.belief),
+                [f"预期（未落实）：{action.label()}"], False, True,
+                receipt.reason, list(receipt.observation), decision,
+                replan_status, self.total_cost,
+                receipt.audit_ok, list(receipt.audit_problems),
+                action.rationale(self.belief),
+                anomalies=anomalies, world_version=self.world_version,
+                fact_added=[], fact_removed=[],
             )
             self.history.append(rec)
             if replan_status == "INFEASIBLE":
                 self.failed = True
             return rec
 
-        # 真世界执行
-        self.world = apply(self.world, action)
-        self.total_cost += action.cost
-        obs = self._observe_after(action)
-        audit_ok, audit_problems = self._audit()
-
-        confirmed = audit_ok
         decision = "按计划执行"
         replan_status = self.last_plan.status if self.last_plan else ""
 
@@ -352,14 +513,21 @@ class Engine:
                 if r.status == "INFEASIBLE":
                     self.failed = True
 
-        if self.belief.has(("working", "pump")):
+        # 结束判定以真世界证据为准，禁止仅凭信念伪报
+        if self.world.has(("working", "pump")) and \
+                self.belief.has(("working", "pump")):
             self.finished = True
 
+        anomalies = self._detect_anomalies(receipt)
         rec = StepRecord(
             idx, action.label(), action.sense, action.cost,
-            [f"预期：{action.label()} -> 真世界已应用"], confirmed, False, "",
-            obs, decision, replan_status, self.total_cost,
-            audit_ok, audit_problems, action.rationale(self.belief),
+            expected, receipt.confirmed, False, "",
+            list(receipt.observation), decision, replan_status,
+            self.total_cost, receipt.audit_ok, list(receipt.audit_problems),
+            action.rationale(self.belief),
+            anomalies=anomalies, world_version=self.world_version,
+            fact_added=[str(f) for f in receipt.delta.added],
+            fact_removed=[str(f) for f in receipt.delta.removed],
         )
         self.history.append(rec)
         return rec
@@ -401,16 +569,32 @@ class Engine:
             "finished": self.finished,
             "failed": self.failed,
             "total_cost": self.total_cost,
+            "world_version": self.world_version,
             "world": state_view(self.world),
             "belief": state_view(self.belief),
             "plan_queue": [a.label() for a in self.plan_queue],
             "last_plan": self.last_plan.to_dict() if self.last_plan else None,
             "history": [asdict(h) for h in self.history],
+            "receipts": [r.to_dict() for r in self.receipts],
             "audit": self._audit()[1] or ["守恒检查通过"],
             "audit_ok": self._audit()[0],
+            "anomalies": self._current_anomalies(),
             "world_locations": self._location_table(self.world),
             "belief_locations": self._location_table(self.belief),
         }
+
+    def _current_anomalies(self) -> list[str]:
+        latest = self.receipts[-1] if self.receipts else None
+        anomalies = list(self._detect_anomalies(latest)) if latest else []
+        if self.failed and not self.finished:
+            anomalies.append("运行状态：已失败/不可行")
+        elif self.finished:
+            anomalies.append("运行状态：已完成（真世界 working(pump) 已确认）")
+        elif self.last_plan is not None and self.last_plan.status == "INFEASIBLE":
+            anomalies.append("运行状态：规划不可行，等待场景调整")
+        else:
+            anomalies.append("运行状态：执行中")
+        return anomalies
 
     def _location_table(self, s: State) -> dict[str, str]:
         table = {}

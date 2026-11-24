@@ -126,6 +126,58 @@ class State:
                     return f[2]
         return None
 
+    def snapshot(self) -> "State":
+        """显式快照：State 本身不可变，返回自身即冻结副本。
+
+        规划器只允许消费该入口给出的快照，禁止持有真世界对象本身。
+        """
+        return self
+
+    def fingerprint(self) -> tuple:
+        """快照指纹：用于版本号与提交前复核前提读集。"""
+        return (tuple(sorted(self.facts)),
+                tuple(sorted(self.counts)),
+                tuple(sorted(self.assumptions)))
+
+
+def facts_diff(before: "State", after: "State") -> "FactDelta":
+    """动作前后事实差分：新增/移除的确认事实与假设分别列出。
+
+    动作回执携带该差分，作为"世界效果"的执行证据；无事实变化时为空差分。
+    """
+    return FactDelta(
+        added=tuple(sorted(after.facts - before.facts)),
+        removed=tuple(sorted(before.facts - after.facts)),
+        assumptions_added=tuple(sorted(after.assumptions - before.assumptions)),
+        assumptions_removed=tuple(sorted(before.assumptions - after.assumptions)),
+        counts_before=tuple(sorted(before.counts)),
+        counts_after=tuple(sorted(after.counts)),
+    )
+
+
+@dataclass(frozen=True)
+class FactDelta:
+    """两个 State 快照之间的事实差分（动作回执的世界效果证据）。"""
+    added: Tuple[Fact, ...] = ()
+    removed: Tuple[Fact, ...] = ()
+    assumptions_added: Tuple[Fact, ...] = ()
+    assumptions_removed: Tuple[Fact, ...] = ()
+    counts_before: Tuple[Tuple[str, int], ...] = ()
+    counts_after: Tuple[Tuple[str, int], ...] = ()
+
+    def is_empty(self) -> bool:
+        return not (self.added or self.removed
+                    or self.assumptions_added or self.assumptions_removed
+                    or self.counts_before != self.counts_after)
+
+    def to_dict(self) -> dict:
+        return {
+            "added": [str(f) for f in self.added],
+            "removed": [str(f) for f in self.removed],
+            "assumptions_added": [str(f) for f in self.assumptions_added],
+            "assumptions_removed": [str(f) for f in self.assumptions_removed],
+        }
+
 
 # 所有实体化物品（工具 + 零件 + 封条），用于资源守恒审计
 TRACKED_ITEMS = frozenset(

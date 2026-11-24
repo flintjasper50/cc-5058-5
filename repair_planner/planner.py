@@ -1,7 +1,11 @@
 """信念空间规划器（BFS 最短序列 + 真实代价累计 + 搜索成本统计）。
 
-阶段政策（对未观察信息的明确处理）：
-- 泵未检查前，故障未知，任何维修动作都无法被证明相关：规划器只考虑
+规划/执行解耦边界：
+- 规划器只消费显式快照（State.snapshot()），绝不导入执行器、不持有真世界；
+  搜索过程的每一步推演都走分支模拟器（私有资源表、独立版本），
+  取消分支或弹出已预约步骤不会消耗现场配件。
+- 阶段政策（对未观察信息的明确处理）：
+  泵未检查前，故障未知，任何维修动作都无法被证明相关：规划器只考虑
   导航、抓取、放下、检查、开箱这类信息收集动作，避免在搬运动作组合中爆炸。
 - 检查获得故障后，开放完整维修动作集合进行目标搜索。
 - BFS 保证动作步数最短；路径上每步的移动边权/资源代价另行累计为真实成本。
@@ -15,7 +19,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .model import State, Fact, working
-from .domain import Action, available_actions, apply
+from .actions import Action, available_actions
+from .simulator import simulate_step
 from .scenario import ADJACENCY
 
 NODE_LIMIT = 8000
@@ -28,13 +33,15 @@ SENSE_PHASE_KINDS = frozenset(
 
 @dataclass
 class PlanResult:
-    status: str                 # OK / NEED_OBSERVATION / INFEASIBLE
+    status: str                 # OK / NEED_OBSERVATION / INFEASIBLE / PARTIAL
     actions: list[Action] = field(default_factory=list)
     cost: int = 0
     expanded: int = 0
     generated: int = 0
     reason: str = ""
     why_infeasible: list[str] = field(default_factory=list)
+    # 计划所依据的信念快照指纹：执行器提交前据此复核前提读集
+    snapshot_fingerprint: tuple = ()
     _step_states: list = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
@@ -45,9 +52,11 @@ class PlanResult:
             "generated": self.generated,
             "reason": self.reason,
             "why_infeasible": self.why_infeasible,
+            "snapshot_fingerprint": [list(x) for x in self.snapshot_fingerprint],
             "steps": [
                 {"action": a.label(), "kind": a.kind, "sense": a.sense,
-                 "cost": a.cost, "rationale": a.rationale(s)}
+                 "cost": a.cost, "rationale": a.rationale(s),
+                 "pre": [str(p) for p in a.pre]}
                 for a, s in self._step_states
             ],
         }
@@ -104,7 +113,12 @@ def _search(start: State, is_goal: Callable[[State], bool],
                 path.append((action, state))
                 return path, _path_cost(parent, key) + action.cost, \
                     expanded, generated + 1, note
-            nxt = apply(state, action)
+            # 搜索后继经分支模拟器生成：私有快照/资源表/版本，
+            # 该分支被剪枝或弹出时不产生任何真实配件消耗。
+            sim = simulate_step(state, action, ADJACENCY, sim_version=generated)
+            if not sim.ok:
+                continue
+            nxt = sim.after
             nkey = _key(nxt)
             if nkey not in parent:
                 parent[nkey] = (key, action, state)
@@ -161,6 +175,15 @@ def _infeasible_reasons(belief: State) -> list[str]:
 
 
 def plan(belief: State, goal: Fact = working("pump")) -> PlanResult:
+    # 边界：规划器只消费显式快照。State 不可变，snapshot() 给出冻结入口，
+    # 规划器后续不保留任何对外部真世界对象的引用。
+    belief = belief.snapshot()
+    fingerprint = belief.fingerprint()
+
+    def _stamp(result: PlanResult) -> PlanResult:
+        result.snapshot_fingerprint = fingerprint
+        return result
+
     # 阶段一：未诊断，感知目标固定为检查泵（不提前开箱，避免无关节点）
     if not belief.has(("inspected", "pump")):
         sense_path, scost, sexp, sgen, note = _astar(
@@ -177,11 +200,11 @@ def plan(belief: State, goal: Fact = working("pump")) -> PlanResult:
                        "观察前不臆测故障；检查后自动重新规划",
             )
             r._step_states = sense_path
-            return r
-        return PlanResult(
+            return _stamp(r)
+        return _stamp(PlanResult(
             status="INFEASIBLE", expanded=sexp, generated=sgen, reason=note,
             why_infeasible=_infeasible_reasons(belief),
-        )
+        ))
 
     # 阶段二：已诊断，完整目标搜索（可能基于未经观察证实的备件假设）
     path, cost, expanded, generated, note = _astar(
@@ -197,7 +220,7 @@ def plan(belief: State, goal: Fact = working("pump")) -> PlanResult:
                        expanded=expanded, generated=generated,
                        reason="已诊断故障，搜索到满足目标的完整维修序列")
         r._step_states = path
-        return r
+        return _stamp(r)
 
     # 若完整计划依赖未证实的备件假设，不直接宣布可执行：
     # 先规划到"旧阀已拆"的半成品，再在取件动作上由真世界证真/证伪。
@@ -221,14 +244,14 @@ def plan(belief: State, goal: Fact = working("pump")) -> PlanResult:
                            "形成半成品，取件时再由真世界确认，假设证伪即重规划",
                 )
                 r._step_states = hpath
-                return r
+                return _stamp(r)
 
     if cost >= 0:
         r = PlanResult(status="OK", actions=[a for a, _ in path], cost=cost,
                        expanded=expanded, generated=generated,
                        reason="已诊断故障且备件已观察确认，搜索到完整维修序列")
         r._step_states = path
-        return r
+        return _stamp(r)
 
     # 目标暂不可达且仍有感知动作（如未开箱核实备件）：信息优先
     sense_path, scost, sexp, sgen, snote = _astar(
@@ -242,7 +265,7 @@ def plan(belief: State, goal: Fact = working("pump")) -> PlanResult:
             reason="当前信念下完整方案不可达，先执行感知动作确认隐藏信息后再规划",
         )
         r._step_states = sense_path
-        return r
+        return _stamp(r)
 
     # 无感知动作、完整目标不可达：推进任何仍可做的不可逆拆分工序（半成品）
     progress_goals = [
@@ -266,11 +289,11 @@ def plan(belief: State, goal: Fact = working("pump")) -> PlanResult:
                        "拆分后将基于新状态重新规划，不会提前把设备标记为修好",
             )
             r._step_states = ppath
-            return r
+            return _stamp(r)
 
-    return PlanResult(
+    return _stamp(PlanResult(
         status="INFEASIBLE", expanded=expanded + sexp,
         generated=generated + sgen,
         reason=note or "主目标不可达、无感知动作、也无任何可推进的拆分工序",
         why_infeasible=_infeasible_reasons(belief),
-    )
+    ))

@@ -70,6 +70,8 @@ tr.phantom td { color: var(--bad); font-weight: 600; }
 .chip:hover { border-color: var(--accent); }
 .chip.assumed-chip { border-color: var(--sense); color: var(--sense); }
 .audit { margin-top: 10px; padding: 10px 12px; border-radius: 8px; font-size: 13px; }
+#anomalyBox { margin: 8px 0 12px; }
+.anomaly { color: var(--bad); font-weight: 600; }
 .audit.pass { background: rgba(63,185,107,.12); border: 1px solid var(--ok); }
 .audit.fail { background: rgba(229,83,75,.12); border: 1px solid var(--bad); }
 .error { background: rgba(229,83,75,.15); border: 1px solid var(--bad); padding: 10px;
